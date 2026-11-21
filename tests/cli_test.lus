@@ -1,0 +1,112 @@
+local ROOT = string.match(TEST_DIR, "^(.*)[/\\][^/\\]*$")
+pledge("load", "fs:read=" .. ROOT .. "/*")
+package.path = ROOT .. "/?.lus;" .. package.path
+
+local cli = require("cli")
+
+local function make()
+    local program = cli.program("todo", "1.2.0"):describe("Keeps a list of tasks.")
+    program:option("-v, --verbose", "print more")
+    program:command("add <title> [notes...]", "add a task")
+        :option("-p, --priority <n>", "priority", { type = "integer", default = 3 })
+        :option("--done", "mark it done")
+        :option("-t, --tag <name>", "a tag", { repeatable = true })
+        :option("--no-color", "plain output")
+        :option("--format <f>", "output format", { choices = { "text", "json" } })
+    program:command("list [filter]", "list tasks")
+    return program
+end
+
+local function arguments_test()
+    local cmd, args, options = make():parse({ "add", "Buy milk", "2 litres", "whole" })
+    assert(cmd.name == "add")
+    assert(args.title == "Buy milk")
+    assert(#args.notes == 2 and args.notes[2] == "whole")
+    assert(options.priority == 3)
+    assert(options.done == nil)
+    assert(options.color == true)
+end
+
+local function options_test()
+    local _, _, options = make():parse({ "add", "x", "-p", "5", "--done", "--tag=a", "-t", "b", "--no-color", "-v" })
+    assert(options.priority == 5 and math.type(options.priority) == "integer")
+    assert(options.done == true)
+    assert(options.tag[1] == "a" and options.tag[2] == "b")
+    assert(options.color == false)
+    assert(options.verbose == true)
+end
+
+local function short_groups_test()
+    local _, _, options = make():parse({ "add", "x", "-vp9" })
+    assert(options.verbose == true and options.priority == 9)
+end
+
+local function double_dash_test()
+    local _, args = make():parse({ "add", "--", "--not-an-option" })
+    assert(args.title == "--not-an-option")
+end
+
+local function negative_number_value_test()
+    local _, _, options = make():parse({ "add", "x", "-p", "-1" })
+    assert(options.priority == -1)
+end
+
+local function errors_test()
+    local cases = {
+        { { "add" }, "missing argument 'title'" },
+        { { "add", "x", "--bogus" }, "unknown option '--bogus'" },
+        { { "add", "x", "-p" }, "option '-p' needs a value" },
+        { { "add", "x", "-p", "high" }, "option '--priority' expects an integer, got 'high'" },
+        { { "add", "x", "--format", "xml" }, "option '--format' must be one of text, json, got 'xml'" },
+        { { "list", "a", "b" }, "unexpected argument 'b'" },
+        { { "remove" }, "unknown command 'remove'" },
+        { { "add", "x", "--done=yes" }, "option '--done' takes no value" },
+    }
+    for _, case in ipairs(cases) do
+        local ok, err = catch make():parse(case[1])
+        assert(not ok, case[2])
+        assert(cli.iserror(err))
+        assert(err.message == case[2], err.message)
+    end
+end
+
+local function help_test()
+    local program = make()
+    local _, _, options = program:parse({ "--help" })
+    assert(options.help == true)
+    local text = program:help()
+    assert(text:find("^Usage: todo %[options%] <command>\n"))
+    assert(text:find("Keeps a list of tasks.", 1, true))
+    assert(text:find("  add <title> [notes...]  add a task", 1, true))
+    local add = program.commands.add:help()
+    assert(add:find("^Usage: todo add %[options%] <title> %[notes...%]"))
+    assert(add:find("(default: 3)", 1, true))
+end
+
+local function action_test()
+    local seen
+    local program = cli.program("tool")
+    program:command("greet <name>"):option("--loud"):action(function(args, options)
+        seen = (options.loud and "HELLO " or "hello ") .. args.name
+        return "done"
+    end)
+    assert(program:run({ "greet", "lus", "--loud" }) == "done")
+    assert(seen == "HELLO lus")
+end
+
+local function schema_option_test()
+    local port = {
+        check = function(self, v)
+            local n = math.tointeger(tonumber(v))
+            if n and n > 0 and n < 65536 then
+                return true, n
+            end
+            return false, { message = "expected a port" }
+        end,
+    }
+    local program = cli.program("srv"):option("--port <p>", "port", { schema = port })
+    local _, _, options = program:parse({ "--port", "8080" })
+    assert(options.port == 8080)
+    local ok, err = catch program:parse({ "--port", "0" })
+    assert(not ok and err.message == "option '--port': expected a port")
+end

@@ -1,0 +1,476 @@
+--- Parses command line arguments into commands, options, and arguments.
+---
+--- A program declares its commands with `cli.program` and `command`, their
+--- arguments in the command string, and their options with `option`.
+--- `program:run(arg)` parses the arguments, prints help and errors, and
+--- calls the action of the command. `program:parse(list)` returns the
+--- result without running anything.
+---
+--- @package cli
+--- @version 0.1.0
+--- @lus 2.0
+--- @license 0BSD
+--- @repository https://github.com/lus-lang/atmos-cli
+
+local M = {}
+
+local CliError = {}
+CliError.__index = CliError
+CliError.__tostring = function(e) return e.message end
+
+local function raise(command, message)
+    error(setmetatable({ message = message, command = command }, CliError), 0)
+end
+
+--- Returns true if `value` is an error object that `parse` raised.
+--- @param value any The value to test.
+--- @return boolean
+function M.iserror(value)
+    return getmetatable(value) == CliError
+end
+
+local Command = {}
+Command.__index = Command
+
+local function new_command(name, parent)
+    return setmetatable({
+        name = name,
+        parent = parent,
+        arguments = {},
+        options = {},
+        by_flag = {},
+        commands = {},
+        command_list = {},
+        description = nil,
+    }, Command)
+end
+
+local function parse_arguments(spec)
+    local list = {}
+    for token in spec:gmatch("%S+") do
+        local required = token:match("^<(.+)>$")
+        local optional = token:match("^%[(.+)%]$")
+        local name = required or optional
+        if name == nil then
+            error(`invalid argument '$token', expected <name> or [name]`, 3)
+        end
+        local variadic = name:sub(-3) == "..."
+        if variadic then
+            name = name:sub(1, -4)
+        end
+        list[#list + 1] = { name = name, required = required ~= nil, variadic = variadic }
+    end
+    return list
+end
+
+--- Creates a program.
+---
+--- `--help` and, when `version` is given, `--version` are built in.
+--- @param name string The name of the program, used in the usage line.
+--- @param version string? The version that `--version` prints.
+--- @return table
+function M.program(name, version)
+    local program = new_command(name, nil)
+    program.version = version
+    program:option("-h, --help", "show help")
+    if version then
+        program:option("-V, --version", "show the version")
+    end
+    return program
+end
+
+--- Sets the description that the help shows.
+--- @param text string The description.
+--- @return table The command, for chaining.
+function Command:describe(text)
+    self.description = text
+    return self
+end
+
+--- Declares the arguments of the command, as in `"<src> [dest]"`.
+--- @param spec string The arguments.
+--- @return table The command, for chaining.
+function Command:arguments_spec(spec)
+    self.arguments = parse_arguments(spec)
+    return self
+end
+
+--- Adds a subcommand and returns it.
+---
+--- `spec` is the name followed by the arguments: `<name>` for a required
+--- argument, `[name]` for an optional one, and `...` after the name for a
+--- list that takes the remaining arguments.
+--- @param spec string The name and the arguments, as in `"add <title> [notes...]"`.
+--- @param description string? The description.
+--- @return table The new command.
+function Command:command(spec, description)
+    local name, rest = spec:match("^(%S+)%s*(.*)$")
+    local cmd = new_command(name, self)
+    cmd.arguments = parse_arguments(rest)
+    cmd.description = description
+    cmd:option("-h, --help", "show help")
+    self.commands[name] = cmd
+    self.command_list[#self.command_list + 1] = cmd
+    return cmd
+end
+
+local CONVERT = {
+    string = function(v) return v end,
+    number = function(v) return tonumber(v) end,
+    integer = function(v) return math.tointeger(tonumber(v)) end,
+}
+
+--- Adds an option.
+---
+--- `flags` names a short flag, a long flag, or both, and a value
+--- placeholder when the option takes a value: `"-p, --port <n>"` takes a
+--- required value and `"--color [when]"` an optional one. A long flag of the
+--- form `--no-NAME` sets `NAME` to `false`. `config` may hold `type`
+--- (`"string"`, `"integer"`, `"number"`, or `"boolean"`), `default`,
+--- `required`, `choices`, `repeatable` to collect every value in a list, and
+--- `schema`, a value with a `check` method such as a `schema` package schema.
+--- The option is stored under its long name with dashes turned into
+--- underscores.
+--- @param flags string The flags.
+--- @param description string? The description.
+--- @param config table? The configuration.
+--- @return table The command, for chaining.
+function Command:option(flags, description, config)
+    config = config or {}
+    local short = flags:match("^%-(%a)[,%s]") or flags:match("^%-(%a)$")
+    local long = flags:match("%-%-([%w][%w%-]*)")
+    local value_req = flags:match("<([^>]+)>")
+    local value_opt = flags:match("%[([^%]]+)%]")
+    local negated = long and long:match("^no%-(.+)$")
+    local key = (negated or long or short):gsub("%-", "_")
+    local takes = value_req ~= nil or value_opt ~= nil
+    local opt = {
+        flags = flags,
+        short = short,
+        long = long,
+        key = key,
+        description = description,
+        takes = takes,
+        value_required = value_req ~= nil,
+        negated = negated ~= nil,
+        type = config.type or (takes and "string" or "boolean"),
+        default = config.default,
+        required = config.required,
+        choices = config.choices,
+        repeatable = config.repeatable,
+        schema = config.schema,
+    }
+    if negated and opt.default == nil then
+        opt.default = true
+    end
+    self.options[#self.options + 1] = opt
+    if short then
+        self.by_flag["-" .. short] = opt
+    end
+    if long then
+        self.by_flag["--" .. long] = opt
+    end
+    return self
+end
+
+--- Sets the function that `run` calls for this command.
+---
+--- The action receives the arguments table, the options table, and the
+--- command. A list argument is a list of strings.
+--- @param fn function The action.
+--- @return table The command, for chaining.
+function Command:action(fn)
+    self.handler = fn
+    return self
+end
+
+local function full_name(cmd)
+    local names = {}
+    while cmd do
+        table.insert(names, 1, cmd.name)
+        cmd = cmd.parent
+    end
+    return table.concat(names, " ")
+end
+
+local function convert(cmd, opt, raw)
+    if opt.schema then
+        local ok, value = opt.schema:check(raw)
+        if not ok then
+            raise(cmd, `option '$(opt.long and "--" .. opt.long or "-" .. opt.short)': $(value.message or tostring(value))`)
+        end
+        return value
+    end
+    local value = CONVERT[opt.type](raw)
+    if value == nil then
+        raise(cmd, `option '$(opt.long and "--" .. opt.long or "-" .. opt.short)' expects $(opt.type == "integer" and "an integer" or "a number"), got '$raw'`)
+    end
+    if opt.choices then
+        local found = false
+        for _, c in ipairs(opt.choices) do
+            if c == value then
+                found = true
+            end
+        end
+        if not found then
+            raise(cmd, `option '--$(opt.long)' must be one of $(table.concat(opt.choices, ", ")), got '$raw'`)
+        end
+    end
+    return value
+end
+
+local function store(options, opt, value)
+    if opt.repeatable then
+        local list = options[opt.key]
+        if type(list) ~= "table" then
+            list = {}
+            options[opt.key] = list
+        end
+        list[#list + 1] = value
+    else
+        options[opt.key] = value
+    end
+end
+
+--- Parses a list of arguments without running an action.
+---
+--- Returns the command that the arguments select, a table of arguments by
+--- name, and a table of options by key. `--help` and `--version` are
+--- returned as the options `help` and `version`. An unknown option, a
+--- missing value, a missing argument, or a value of the wrong type raises an
+--- error object with `message` and `command`. A `--` ends the options, so
+--- every later word is an argument.
+--- @param list table The arguments, such as the global `arg`.
+--- @return table The command.
+--- @return table The arguments.
+--- @return table The options.
+function Command:parse(list)
+    local cmd = self
+    local options, positional = {}, {}
+    local i, n = 1, #list
+    local only_args = false
+    -- Options of parent commands are accepted after a subcommand too.
+    local function find(flag)
+        local c = cmd
+        while c do
+            local opt = c.by_flag[flag]
+            if opt then
+                return opt
+            end
+            c = c.parent
+        end
+        return nil
+    end
+    while i <= n do
+        local word = list[i]
+        if only_args or word == "-" or word:sub(1, 1) ~= "-" then
+            local sub = #positional == 0 and not only_args and cmd.commands[word]
+            if sub then
+                cmd = sub
+            else
+                positional[#positional + 1] = word
+            end
+        elseif word == "--" then
+            only_args = true
+        else
+            local flag, inline = word:match("^(%-%-[^=]+)=(.*)$")
+            flag = flag or word
+            if flag:sub(1, 2) ~= "--" and #flag > 2 then
+                -- A group of short flags such as -abc, where only the last may take a value.
+                local expanded = {}
+                for j = 2, #flag do
+                    local opt = find("-" .. flag:sub(j, j))
+                    if opt and opt.takes and j < #flag then
+                        expanded[#expanded + 1] = "-" .. flag:sub(j, j)
+                        expanded[#expanded + 1] = flag:sub(j + 1)
+                        break
+                    end
+                    expanded[#expanded + 1] = "-" .. flag:sub(j, j)
+                end
+                for k = #expanded, 1, -1 do
+                    table.insert(list, i + 1, expanded[k])
+                end
+                n = #list
+                i = i + 1
+                continue
+            end
+            local opt = find(flag)
+            if opt == nil then
+                raise(cmd, `unknown option '$flag'`)
+            end
+            if opt.takes then
+                local value = inline
+                if value == nil then
+                    local nxt = list[i + 1]
+                    if nxt ~= nil and (nxt:sub(1, 1) ~= "-" or nxt == "-" or tonumber(nxt)) then
+                        value = nxt
+                        i = i + 1
+                    end
+                end
+                if value == nil then
+                    if opt.value_required then
+                        raise(cmd, `option '$flag' needs a value`)
+                    end
+                    value = true
+                else
+                    value = convert(cmd, opt, value)
+                end
+                store(options, opt, value)
+            else
+                if inline ~= nil then
+                    raise(cmd, `option '$flag' takes no value`)
+                end
+                store(options, opt, not opt.negated)
+            end
+        end
+        i = i + 1
+    end
+
+    if options.help or options.version then
+        return cmd, {}, options
+    end
+
+    local args = {}
+    local p = 1
+    for _, a in ipairs(cmd.arguments) do
+        if a.variadic then
+            local rest = {}
+            for j = p, #positional do
+                rest[#rest + 1] = positional[j]
+            end
+            p = #positional + 1
+            if a.required and #rest == 0 then
+                raise(cmd, `missing argument '$(a.name)'`)
+            end
+            args[a.name] = rest
+        else
+            local value = positional[p]
+            if value == nil and a.required then
+                raise(cmd, `missing argument '$(a.name)'`)
+            end
+            args[a.name] = value
+            p = p + 1
+        end
+    end
+    if p <= #positional then
+        if #cmd.command_list > 0 and #cmd.arguments == 0 then
+            raise(cmd, `unknown command '$(positional[p])'`)
+        end
+        raise(cmd, `unexpected argument '$(positional[p])'`)
+    end
+    -- Defaults and required options, from the selected command up.
+    local c = cmd
+    while c do
+        for _, opt in ipairs(c.options) do
+            if options[opt.key] == nil then
+                if opt.required then
+                    raise(cmd, `missing option '--$(opt.long)'`)
+                end
+                options[opt.key] = opt.default
+            end
+        end
+        c = c.parent
+    end
+    return cmd, args, options
+end
+
+--- Returns the help text of the command.
+--- @return string
+function Command:help()
+    local lines = {}
+    local usage = { "Usage: " .. full_name(self) }
+    if #self.options > 0 then
+        usage[#usage + 1] = "[options]"
+    end
+    if #self.command_list > 0 then
+        usage[#usage + 1] = "<command>"
+    end
+    for _, a in ipairs(self.arguments) do
+        local text = a.name .. (a.variadic and "..." or "")
+        usage[#usage + 1] = a.required and `<$text>` or `[$text]`
+    end
+    lines[#lines + 1] = table.concat(usage, " ")
+    if self.description then
+        lines[#lines + 1] = ""
+        lines[#lines + 1] = self.description
+    end
+    local function section(title, rows)
+        if #rows == 0 then
+            return
+        end
+        local width = 0
+        for _, r in ipairs(rows) do
+            width = math.max(width, utf8.len(r[1]) or #r[1])
+        end
+        lines[#lines + 1] = ""
+        lines[#lines + 1] = title
+        for _, r in ipairs(rows) do
+            local pad = string.rep(" ", width - (utf8.len(r[1]) or #r[1]))
+            lines[#lines + 1] = ("  " .. r[1] .. pad .. "  " .. (r[2] or "")):match("^(.-)%s*$")
+        end
+    end
+    local option_rows = {}
+    for _, opt in ipairs(self.options) do
+        local desc = opt.description or ""
+        if opt.default ~= nil and opt.type ~= "boolean" then
+            desc = desc .. ` (default: $(tostring(opt.default)))`
+        end
+        option_rows[#option_rows + 1] = { opt.short and not opt.long and opt.flags or (opt.short and opt.flags or "    " .. opt.flags), desc }
+    end
+    local command_rows = {}
+    for _, cmd in ipairs(self.command_list) do
+        local spec = { cmd.name }
+        for _, a in ipairs(cmd.arguments) do
+            local text = a.name .. (a.variadic and "..." or "")
+            spec[#spec + 1] = a.required and `<$text>` or `[$text]`
+        end
+        command_rows[#command_rows + 1] = { table.concat(spec, " "), cmd.description }
+    end
+    section("Options:", option_rows)
+    section("Commands:", command_rows)
+    return table.concat(lines, "\n") .. "\n"
+end
+
+--- Parses `list`, prints help, the version, or an error, and runs the
+--- action of the selected command.
+---
+--- An error prints its message and the usage line to standard error and
+--- exits with status 2. A command without an action prints its help. The
+--- result is the result of the action.
+--- @param list table The arguments, usually the global `arg`.
+--- @return any
+function Command:run(list)
+    local args_list = {}
+    for i = 1, #(list or {}) do
+        args_list[i] = list[i]
+    end
+    local ok, cmd, args, options = catch self:parse(args_list)
+    if not ok then
+        local err = cmd
+        if getmetatable(err) ~= CliError then
+            error(err, 0)
+        end
+        local usage = err.command:help():match("^([^\n]*)")
+        io.stderr:write(`error: $(err.message)\n$usage\nRun '$(full_name(err.command)) --help' for details.\n`)
+        os.exit(2)
+    end
+    if options.help then
+        io.stdout:write(cmd:help())
+        return
+    end
+    if options.version then
+        local root = cmd
+        while root.parent do
+            root = root.parent
+        end
+        io.stdout:write(root.version, "\n")
+        return
+    end
+    if cmd.handler == nil then
+        io.stdout:write(cmd:help())
+        return
+    end
+    return cmd.handler(args, options, cmd)
+end
+
+return M
