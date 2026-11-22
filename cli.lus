@@ -253,8 +253,7 @@ function Command:parse(list)
     local function find(flag)
         local c = cmd
         while c do
-            local opt = c.by_flag[flag]
-            if opt then
+            if opt = c.by_flag[flag] then
                 return opt
             end
             c = c.parent
@@ -264,8 +263,7 @@ function Command:parse(list)
     while i <= n do
         local word = list[i]
         if only_args or word == "-" or word:sub(1, 1) ~= "-" then
-            local sub = #positional == 0 and not only_args and cmd.commands[word]
-            if sub then
+            if sub = #positional == 0 and not only_args and cmd.commands[word] then
                 cmd = sub
             else
                 positional[#positional + 1] = word
