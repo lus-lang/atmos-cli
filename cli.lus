@@ -7,7 +7,7 @@
 --- result without running anything.
 ---
 --- @package cli
---- @version 0.1.0
+--- @version 1.0.0
 --- @lus 2.0
 --- @license 0BSD
 --- @repository https://github.com/lus-lang/atmos-cli
@@ -79,7 +79,7 @@ function M.program(name, version)
     return program
 end
 
---- Sets the description that the help shows.
+--- Sets the description that appears in the help text of the command.
 --- @param text string The description.
 --- @return table The command, for chaining.
 function Command:describe(text)
@@ -185,10 +185,14 @@ function Command:action(fn)
 end
 
 local function full_name(cmd)
-    local names = {}
+    local names, n = {}, 0
     while cmd do
-        table.insert(names, 1, cmd.name)
+        n = n + 1
+        names[n] = cmd.name
         cmd = cmd.parent
+    end
+    for i = 1, n // 2 do
+        names[i], names[n - i + 1] = names[n - i + 1], names[i]
     end
     return table.concat(names, " ")
 end
@@ -404,7 +408,7 @@ function Command:help()
         lines[#lines + 1] = title
         for _, r in ipairs(rows) do
             local pad = string.rep(" ", width - (utf8.len(r[1]) or #r[1]))
-            lines[#lines + 1] = ("  " .. r[1] .. pad .. "  " .. (r[2] or "")):match("^(.-)%s*$")
+            lines[#lines + 1] = (`  $(r[1])$pad  $(r[2] or "")`):match("^(.-)%s*$")
         end
     end
     local option_rows = {}
@@ -429,12 +433,13 @@ function Command:help()
     return table.concat(lines, "\n") .. "\n"
 end
 
---- Parses `list`, prints help, the version, or an error, and runs the
---- action of the selected command.
+--- Parses `list`, then prints the help, the version, or an error, or runs
+--- the action of the selected command.
 ---
---- An error prints its message and the usage line to standard error and
---- exits with status 2. A command without an action prints its help. The
---- result is the result of the action.
+--- On an error, `run` prints the message and the usage line to standard
+--- error, then exits with status 2. For a command without an action, it
+--- prints the help of the command. Otherwise it returns the result of the
+--- action.
 --- @param list table The arguments, usually the global `arg`.
 --- @return any
 function Command:run(list)
