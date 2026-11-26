@@ -4,7 +4,25 @@
 --- arguments in the command string, and their options with `option`.
 --- `program:run(arg)` parses the arguments, prints help and errors, and
 --- calls the action of the command. `program:parse(list)` returns the
---- result without running anything.
+--- result without running anything. The API follows commander, the
+--- command line library for Node.js.
+---
+--- The following program is a to-do list tool whose `add` command takes a
+--- title and an integer priority.
+---
+--- ```lus nocheck
+--- local cli = require("https://atmosp.here/2.0/cli.lus")
+---
+--- local program = cli.program("todo", "1.0.0")
+--- local add = program:command("add <title>")
+--- add:option("-p, --priority <n>", "priority", { type = "integer", default = 3 })
+---
+--- add:action(function(args, options)
+---     print(args.title, options.priority)
+--- end)
+---
+--- program:run(arg)
+--- ```
 ---
 --- @package cli
 --- @version 1.0.0
@@ -16,7 +34,10 @@ local M = {}
 
 local CliError = {}
 CliError.__index = CliError
-CliError.__tostring = function(e) return e.message end
+
+CliError.__tostring = function(e)
+    return e.message
+end
 
 local function raise(command, message)
     error(setmetatable({ message = message, command = command }, CliError), 0)
@@ -47,19 +68,25 @@ end
 
 local function parse_arguments(spec)
     local list = {}
+
     for token in spec:gmatch("%S+") do
         local required = token:match("^<(.+)>$")
         local optional = token:match("^%[(.+)%]$")
         local name = required or optional
+
         if name == nil then
             error(`invalid argument '$token', expected <name> or [name]`, 3)
         end
+
         local variadic = name:sub(-3) == "..."
+
         if variadic then
             name = name:sub(1, -4)
         end
+
         list[#list + 1] = { name = name, required = required ~= nil, variadic = variadic }
     end
+
     return list
 end
 
@@ -73,9 +100,11 @@ function M.program(name, version)
     local program = new_command(name, nil)
     program.version = version
     program:option("-h, --help", "show help")
+
     if version then
         program:option("-V, --version", "show the version")
     end
+
     return program
 end
 
@@ -115,9 +144,15 @@ function Command:command(spec, description)
 end
 
 local CONVERT = {
-    string = function(v) return v end,
-    number = function(v) return tonumber(v) end,
-    integer = function(v) return math.tointeger(tonumber(v)) end,
+    string = function(v)
+        return v
+    end,
+    number = function(v)
+        return tonumber(v)
+    end,
+    integer = function(v)
+        return math.tointeger(tonumber(v))
+    end,
 }
 
 --- Adds an option.
@@ -141,7 +176,7 @@ function Command:option(flags, description, config)
     local long = flags:match("%-%-([%w][%w%-]*)")
     local value_req = flags:match("<([^>]+)>")
     local value_opt = flags:match("%[([^%]]+)%]")
-    local negated = long and long:match("^no%-(.+)$")
+    local negated = long?:match("^no%-(.+)$")
     local key = (negated or long or short):gsub("%-", "_")
     local takes = value_req ~= nil or value_opt ~= nil
     local opt = {
@@ -160,16 +195,21 @@ function Command:option(flags, description, config)
         repeatable = config.repeatable,
         schema = config.schema,
     }
+
     if negated and opt.default == nil then
         opt.default = true
     end
+
     self.options[#self.options + 1] = opt
+
     if short then
-        self.by_flag["-" .. short] = opt
+        self.by_flag[`-$short`] = opt
     end
+
     if long then
-        self.by_flag["--" .. long] = opt
+        self.by_flag[`--$long`] = opt
     end
+
     return self
 end
 
@@ -186,50 +226,76 @@ end
 
 local function full_name(cmd)
     local names, n = {}, 0
+
     while cmd do
         n = n + 1
         names[n] = cmd.name
         cmd = cmd.parent
     end
+
     for i = 1, n // 2 do
         names[i], names[n - i + 1] = names[n - i + 1], names[i]
     end
+
     return table.concat(names, " ")
+end
+
+local function flag_name(opt)
+    return opt.long and `--$(opt.long)` or `-$(opt.short)`
 end
 
 local function convert(cmd, opt, raw)
     if opt.schema then
         local ok, value = opt.schema:check(raw)
+
         if not ok then
-            raise(cmd, `option '$(opt.long and "--" .. opt.long or "-" .. opt.short)': $(value.message or tostring(value))`)
+            raise(cmd, `option '$(flag_name(opt))': $(value.message or tostring(value))`)
         end
+
         return value
     end
+
     local value = CONVERT[opt.type](raw)
+
     if value == nil then
-        raise(cmd, `option '$(opt.long and "--" .. opt.long or "-" .. opt.short)' expects $(opt.type == "integer" and "an integer" or "a number"), got '$raw'`)
+        raise(
+            cmd,
+            `option '$(flag_name(opt))' expects $(opt.type == "integer" and "an integer"
+                or "a number"), got '$raw'`
+        )
     end
+
     if opt.choices then
-        local found = false
-        for _, c in ipairs(opt.choices) do
-            if c == value then
-                found = true
+        local found = do
+            for _, choice in ipairs(opt.choices) do
+                if choice == value then
+                    provide true
+                end
             end
+
+            provide false
         end
+
         if not found then
-            raise(cmd, `option '--$(opt.long)' must be one of $(table.concat(opt.choices, ", ")), got '$raw'`)
+            raise(
+                cmd,
+                `option '--$(opt.long)' must be one of $(table.concat(opt.choices, ", ")), got '$raw'`
+            )
         end
     end
+
     return value
 end
 
 local function store(options, opt, value)
     if opt.repeatable then
         local list = options[opt.key]
+
         if type(list) ~= "table" then
             list = {}
             options[opt.key] = list
         end
+
         list[#list + 1] = value
     else
         options[opt.key] = value
@@ -253,19 +319,25 @@ function Command:parse(list)
     local options, positional = {}, {}
     local i, n = 1, #list
     local only_args = false
+
     -- Options of parent commands are accepted after a subcommand too.
     local function find(flag)
         local c = cmd
+
         while c do
             if opt = c.by_flag[flag] then
                 return opt
             end
+
             c = c.parent
         end
+
         return nil
     end
+
     while i <= n do
         local word = list[i]
+
         if only_args or word == "-" or word:sub(1, 1) ~= "-" then
             if sub = #positional == 0 and not only_args and cmd.commands[word] then
                 cmd = sub
@@ -277,54 +349,71 @@ function Command:parse(list)
         else
             local flag, inline = word:match("^(%-%-[^=]+)=(.*)$")
             flag = flag or word
+
             if flag:sub(1, 2) ~= "--" and #flag > 2 then
                 -- A group of short flags such as -abc, where only the last may take a value.
                 local expanded = {}
+
                 for j = 2, #flag do
-                    local opt = find("-" .. flag:sub(j, j))
-                    if opt and opt.takes and j < #flag then
-                        expanded[#expanded + 1] = "-" .. flag:sub(j, j)
+                    local short = `-$(flag:sub(j, j))`
+                    local opt = find(short)
+
+                    if opt?.takes and j < #flag then
+                        expanded[#expanded + 1] = short
                         expanded[#expanded + 1] = flag:sub(j + 1)
                         break
                     end
-                    expanded[#expanded + 1] = "-" .. flag:sub(j, j)
+
+                    expanded[#expanded + 1] = short
                 end
+
                 for k = #expanded, 1, -1 do
                     table.insert(list, i + 1, expanded[k])
                 end
+
                 n = #list
                 i = i + 1
                 continue
             end
+
             local opt = find(flag)
+
             if opt == nil then
                 raise(cmd, `unknown option '$flag'`)
             end
+
             if opt.takes then
                 local value = inline
+
                 if value == nil then
                     local nxt = list[i + 1]
+
                     if nxt ~= nil and (nxt:sub(1, 1) ~= "-" or nxt == "-" or tonumber(nxt)) then
                         value = nxt
                         i = i + 1
                     end
                 end
+
                 if value == nil then
                     if opt.value_required then
                         raise(cmd, `option '$flag' needs a value`)
                     end
+
                     value = true
                 else
                     value = convert(cmd, opt, value)
                 end
+
                 store(options, opt, value)
             else
                 if inline ~= nil then
                     raise(cmd, `option '$flag' takes no value`)
                 end
+
                 store(options, opt, not opt.negated)
             end
         end
+
         i = i + 1
     end
 
@@ -334,100 +423,131 @@ function Command:parse(list)
 
     local args = {}
     local p = 1
+
     for _, a in ipairs(cmd.arguments) do
         if a.variadic then
-            local rest = {}
-            for j = p, #positional do
-                rest[#rest + 1] = positional[j]
-            end
+            local rest = p <= #positional and positional[p,] or {}
             p = #positional + 1
+
             if a.required and #rest == 0 then
                 raise(cmd, `missing argument '$(a.name)'`)
             end
+
             args[a.name] = rest
         else
             local value = positional[p]
+
             if value == nil and a.required then
                 raise(cmd, `missing argument '$(a.name)'`)
             end
+
             args[a.name] = value
             p = p + 1
         end
     end
+
     if p <= #positional then
         if #cmd.command_list > 0 and #cmd.arguments == 0 then
             raise(cmd, `unknown command '$(positional[p])'`)
         end
+
         raise(cmd, `unexpected argument '$(positional[p])'`)
     end
+
     -- Defaults and required options, from the selected command up.
     local c = cmd
+
     while c do
         for _, opt in ipairs(c.options) do
             if options[opt.key] == nil then
                 if opt.required then
                     raise(cmd, `missing option '--$(opt.long)'`)
                 end
+
                 options[opt.key] = opt.default
             end
         end
+
         c = c.parent
     end
+
     return cmd, args, options
+end
+
+local function argument_usage(a)
+    local text = `$(a.name)$(a.variadic and "..." or "")`
+    return a.required and `<$text>` or `[$text]`
 end
 
 --- Returns the help text of the command.
 --- @return string
 function Command:help()
     local lines = {}
-    local usage = { "Usage: " .. full_name(self) }
+    local usage = { `Usage: $(full_name(self))` }
+
     if #self.options > 0 then
         usage[#usage + 1] = "[options]"
     end
+
     if #self.command_list > 0 then
         usage[#usage + 1] = "<command>"
     end
+
     for _, a in ipairs(self.arguments) do
-        local text = a.name .. (a.variadic and "..." or "")
-        usage[#usage + 1] = a.required and `<$text>` or `[$text]`
+        usage[#usage + 1] = argument_usage(a)
     end
+
     lines[#lines + 1] = table.concat(usage, " ")
+
     if self.description then
         lines[#lines + 1] = ""
         lines[#lines + 1] = self.description
     end
+
     local function section(title, rows)
         if #rows == 0 then
             return
         end
+
         local width = 0
+
         for _, r in ipairs(rows) do
-            width = math.max(width, utf8.len(r[1]) or #r[1])
+            width = math.max(width, #r[1])
         end
+
         lines[#lines + 1] = ""
         lines[#lines + 1] = title
+
         for _, r in ipairs(rows) do
-            local pad = string.rep(" ", width - (utf8.len(r[1]) or #r[1]))
-            lines[#lines + 1] = (`  $(r[1])$pad  $(r[2] or "")`):match("^(.-)%s*$")
+            local pad = string.rep(" ", width - #r[1])
+            lines[#lines + 1] = (`  $(r[1])$pad  $(r[2] or "")`):rtrim()
         end
     end
+
     local option_rows = {}
+
     for _, opt in ipairs(self.options) do
         local desc = opt.description or ""
+
         if opt.default ~= nil and opt.type ~= "boolean" then
-            desc = desc .. ` (default: $(tostring(opt.default)))`
+            desc = `$desc (default: $(tostring(opt.default)))`
         end
-        option_rows[#option_rows + 1] = { opt.short and not opt.long and opt.flags or (opt.short and opt.flags or "    " .. opt.flags), desc }
+
+        option_rows[#option_rows + 1] = { opt.short and opt.flags or `    $(opt.flags)`, desc }
     end
+
     local command_rows = {}
+
     for _, cmd in ipairs(self.command_list) do
         local spec = { cmd.name }
+
         for _, a in ipairs(cmd.arguments) do
-            local text = a.name .. (a.variadic and "..." or "")
-            spec[#spec + 1] = a.required and `<$text>` or `[$text]`
+            spec[#spec + 1] = argument_usage(a)
         end
+
         command_rows[#command_rows + 1] = { table.concat(spec, " "), cmd.description }
     end
+
     section("Options:", option_rows)
     section("Commands:", command_rows)
     return table.concat(lines, "\n") .. "\n"
@@ -443,36 +563,43 @@ end
 --- @param list table The arguments, usually the global `arg`.
 --- @return any
 function Command:run(list)
-    local args_list = {}
-    for i = 1, #(list or {}) do
-        args_list[i] = list[i]
-    end
-    local ok, cmd, args, options = catch self:parse(args_list)
+    local ok, cmd, args, options = catch self:parse((list or {})[1,])
+
     if not ok then
         local err = cmd
-        if getmetatable(err) ~= CliError then
+
+        if not M.iserror(err) then
             error(err, 0)
         end
+
         local usage = err.command:help():match("^([^\n]*)")
-        io.stderr:write(`error: $(err.message)\n$usage\nRun '$(full_name(err.command)) --help' for details.\n`)
+        io.stderr:write(
+            `error: $(err.message)\n$usage\nRun '$(full_name(err.command)) --help' for details.\n`
+        )
         os.exit(2)
     end
+
     if options.help then
         io.stdout:write(cmd:help())
         return
     end
+
     if options.version then
         local root = cmd
+
         while root.parent do
             root = root.parent
         end
+
         io.stdout:write(root.version, "\n")
         return
     end
+
     if cmd.handler == nil then
         io.stdout:write(cmd:help())
         return
     end
+
     return cmd.handler(args, options, cmd)
 end
 
